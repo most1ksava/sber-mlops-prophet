@@ -1,0 +1,20 @@
+{
+  "model_type": "Prophet",
+  "ticker": "SBER",
+  "training_data_range": {
+    "start": "2023-07-03",
+    "end": "2026-07-01"
+  },
+  "training_samples": 869,
+  "best_params": {
+    "changepoint_prior_scale": 0.5,
+    "seasonality_prior_scale": 0.01,
+    "holidays_prior_scale": 0.1
+  },
+  "metrics": {
+    "MAE": 11.45739085181757,
+    "MAPE": 3.707092263483037
+  },
+  "last_training_date": "2026-07-01",
+  "trained_at": "2026-07-02T03:03:10.574780"
+}
