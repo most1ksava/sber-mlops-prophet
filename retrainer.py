@@ -1,16 +1,16 @@
+import asyncio
 import json
 import os
 import pickle
-import time
 from datetime import datetime, timedelta
 
+import httpx
 import mlflow
 import mlflow.pyfunc
 import pandas as pd
-import requests
-import schedule
 from loguru import logger
 from prophet import Prophet
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
 
 from model import StockForecastModel
 
@@ -26,31 +26,34 @@ TRAINING_YEARS = int(os.getenv("TRAINING_YEARS", "3"))
 ARTIFACTS_DIR = "/app/mlflow_artifacts"
 
 
-def fetch_data(ticker, years=3):
+async def fetch_data(ticker, years=3):
     end_date = datetime.today()
     start_date = end_date - timedelta(days=years * 365)
     url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json"
     all_data = []
     current_start = start_date
-    while current_start < end_date:
-        current_end = min(current_start + timedelta(days=180), end_date)
-        params = {
-            "from": current_start.strftime("%Y-%m-%d"),
-            "till": current_end.strftime("%Y-%m-%d"),
-            "interval": 24,
-            "iss.meta": "off",
-        }
-        try:
-            resp = requests.get(url, params=params, timeout=30)
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data["candles"]["data"]
-            if rows:
-                df_chunk = pd.DataFrame(rows, columns=data["candles"]["columns"])
-                all_data.append(df_chunk)
-        except Exception as e:
-            logger.warning(f"Fetch error {current_start.date()}: {e}")
-        current_start = current_end + timedelta(days=1)
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        while current_start < end_date:
+            current_end = min(current_start + timedelta(days=180), end_date)
+            params = {
+                "from": current_start.strftime("%Y-%m-%d"),
+                "till": current_end.strftime("%Y-%m-%d"),
+                "interval": 24,
+                "iss.meta": "off",
+            }
+            try:
+                resp = await client.get(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                rows = data["candles"]["data"]
+                if rows:
+                    df_chunk = pd.DataFrame(rows, columns=data["candles"]["columns"])
+                    all_data.append(df_chunk)
+            except Exception as e:
+                logger.warning(f"Fetch error {current_start.date()}: {e}")
+            current_start = current_end + timedelta(days=1)
+
     if not all_data:
         raise RuntimeError("No data fetched from MOEX")
     df = pd.concat(all_data, ignore_index=True)
@@ -91,7 +94,6 @@ def train_model(df):
         future = test_model.make_future_dataframe(periods=len(test_df), freq="D")
         forecast = test_model.predict(future)
         forecast_test = forecast[forecast["ds"] >= test_df["ds"].min()]
-        from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
         y_true = test_df["y"].values[: len(forecast_test)]
         y_pred = forecast_test["yhat"].values[: len(y_true)]
         metrics = {
@@ -152,10 +154,10 @@ def log_to_mlflow(metadata):
         return run_id, result.version
 
 
-def retrain():
+async def retrain():
     logger.info(f"=== Retrain started at {datetime.now()} ===")
     try:
-        df = fetch_data(TICKER, TRAINING_YEARS)
+        df = await fetch_data(TICKER, TRAINING_YEARS)
         logger.info(f"Fetched {len(df)} rows from MOEX ({df['ds'].min().date()} - {df['ds'].max().date()})")
         model, last_date, best_params, metrics = train_model(df)
         metadata = save_artifacts(model, last_date, best_params, metrics, df)
@@ -163,7 +165,8 @@ def retrain():
         run_id, version = log_to_mlflow(metadata)
         logger.success(f"Retrain complete: v{version}, run={run_id}")
         try:
-            requests.post("http://fastapi:8000/_reload", timeout=5)
+            async with httpx.AsyncClient(timeout=5) as client:
+                await client.post("http://fastapi:8000/_reload")
             logger.info("FastAPI reload triggered")
         except Exception as e:
             logger.warning(f"FastAPI reload failed: {e}")
@@ -171,18 +174,25 @@ def retrain():
         logger.error(f"Retrain failed: {e}")
 
 
-if __name__ == "__main__":
+async def scheduler():
+    last_run_day = -1
+    while True:
+        now = datetime.now()
+        if now.weekday() < 5 and now.hour == 19 and now.minute == 0 and now.day != last_run_day:
+            await retrain()
+            last_run_day = now.day
+        await asyncio.sleep(30)
+
+
+async def main():
     logger.add("retrainer.log", rotation="10 MB")
     logger.info("Retrainer started")
 
-    # Первичное обучение сразу
-    retrain()
+    await retrain()
 
-    # Расписание: будни в 19:00
-    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
-        getattr(schedule.every(), day).at("19:00").do(retrain)
     logger.info("Scheduled retrain: weekdays at 19:00 MSK")
+    await scheduler()
 
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(main())
